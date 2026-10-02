@@ -1,0 +1,9 @@
+# Runtime artifacts — not part of the package
+sessions/
+tmp/
+empty-config/
+usage.jsonl
+state.json
+shim.log
+shim-test.log
+*.bak
