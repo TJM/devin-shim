@@ -1,4 +1,5 @@
 # Runtime artifacts — not part of the package
+bin/
 sessions/
 tmp/
 empty-config/

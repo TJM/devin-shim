@@ -36,6 +36,8 @@
 // the token usage returned inline by session/prompt. Appended to usage.jsonl;
 // GET /v1/usage returns totals.
 
+process.title = "agentmemory-devin-shim";
+
 import http from "node:http";
 import { spawn, execFileSync } from "node:child_process";
 import { appendFile, readFile, writeFile } from "node:fs/promises";

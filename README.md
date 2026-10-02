@@ -51,15 +51,34 @@ The installer:
 
 1. Preflights `node`, `devin` (auth check), `sqlite3`
 2. Stages `shim.mjs` into `~/.agentmemory/devin-shim/` with `sessions/`,
-   `tmp/`, `empty-config/`
-3. Writes `~/Library/LaunchAgents/com.agentmemory.devin-shim.plist`
-   (`RunAtLoad` + `KeepAlive` — starts at login, restarts on crash) and
-   bootstraps it
+   `tmp/`, `empty-config/`, and `bin/` — the latter holds **named symlinks to
+   `node`** (`agentmemory-devin-shim`, `agentmemory`) so the processes show
+   those names in `ps`, Activity Monitor, and System Settings → App
+   Background Activity instead of `node`
+3. Writes two LaunchAgents and bootstraps them:
+   - `com.agentmemory.devin-shim` — the shim (`RunAtLoad` + `KeepAlive`)
+   - `com.agentmemory.daemon` — the agentmemory worker
+     (`cli.mjs` runs foreground, so `KeepAlive` applies; skip with
+     `--no-daemon`)
 4. Comments out the managed keys in `~/.agentmemory/.env` (backup at
    `.env.pre-shim-backup`) and appends the shim block — including
    `OPENAI_EMBEDDING_BASE_URL` pointed at DMR when reachable so embeddings
    stay local
-5. Restarts agentmemory if it's running
+
+Service management:
+
+```bash
+launchctl print gui/$(id -u)/com.agentmemory.devin-shim   # shim status
+launchctl print gui/$(id -u)/com.agentmemory.daemon       # worker status
+launchctl kickstart -k gui/$(id -u)/com.agentmemory.daemon  # restart worker
+```
+
+Note: while the daemon job is bootstrapped, `agentmemory stop` will be
+respawned by `KeepAlive`. To stop it for real:
+
+```bash
+launchctl bootout gui/$(id -u)/com.agentmemory.daemon
+```
 
 ## Verify
 
@@ -87,7 +106,7 @@ tail -f ~/.agentmemory/devin-shim/shim.log      # service log
 ```bash
 ~/.agentmemory/devin-shim/uninstall.sh
 cp ~/.agentmemory/.env.pre-shim-backup ~/.agentmemory/.env
-agentmemory stop && agentmemory
+agentmemory    # restart the daemon manually (launchd no longer owns it)
 ```
 
 ## Caveats
