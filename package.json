@@ -1,0 +1,10 @@
+{
+  "name": "devin-shim",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible /v1/chat/completions backed by a persistent devin acp session",
+  "scripts": {
+    "test": "node --test test/"
+  }
+}

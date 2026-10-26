@@ -105,6 +105,18 @@ tail -f ~/.agentmemory/devin-shim/shim.log      # service log
 | `FALLBACK_URL` | `http://localhost:12434` | OpenAI-compatible fallback (empty = disable) |
 | `FALLBACK_MODEL` | `ai/qwen2.5:7B-Q4_0` | model substituted on fallback requests |
 
+## Tests
+
+```bash
+npm test        # node --test test/
+```
+
+End-to-end, fully offline: `test/fake-devin.mjs` stubs `devin acp` over stdio
+(prompt text `DIE`/`EMPTY`/`BIGCTX` drives the failure modes) and a stub HTTP
+server stands in for the fallback. Covers happy path, session reuse, context
+rotation, fallback, 400/404/502s. `test-acp.mjs` is the live smoke test against
+a real Devin session — it costs a little ACU.
+
 ## Uninstall
 
 ```bash
