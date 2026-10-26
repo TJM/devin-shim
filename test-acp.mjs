@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 // Quick ACP probe: initialize -> session/new -> session/prompt, print chunks.
 import { spawn } from "node:child_process";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SESSIONS_DIR = join(HERE, "sessions");
+const EMPTY_CONFIG = join(HERE, "empty-config");
 
 const child = spawn("devin", ["acp", "--model", "gpt-6-luna-none"], {
-  cwd: "/Users/tmcneely/.agentmemory/devin-shim/sessions",
+  cwd: SESSIONS_DIR,
   env: {
     ...process.env,
     AGENTMEMORY_SDK_CHILD: "1",
-    XDG_CONFIG_HOME: "/Users/tmcneely/.agentmemory/devin-shim/empty-config",
+    XDG_CONFIG_HOME: EMPTY_CONFIG,
   },
   stdio: ["pipe", "pipe", "pipe"],
 });
@@ -65,7 +71,7 @@ const init = await send("initialize", {
 });
 console.log("INIT:", JSON.stringify(init).slice(0, 400));
 
-const sess = await send("session/new", { cwd: "/Users/tmcneely/.agentmemory/devin-shim/sessions", mcpServers: [] });
+const sess = await send("session/new", { cwd: SESSIONS_DIR, mcpServers: [] });
 console.log("SESSION:", JSON.stringify(sess).slice(0, 400));
 sessionId = sess.sessionId;
 

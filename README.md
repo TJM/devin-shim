@@ -33,14 +33,18 @@ agentmemory ──OPENAI_BASE_URL──> devin-shim (:12440) ──ACP──> de
 
 ## Prerequisites
 
-- macOS with the **Devin CLI** installed and authenticated
-  (`devin auth login`, enterprise)
-- **Node.js** and `sqlite3` (macOS built-in)
+- **Devin CLI** installed and authenticated (`devin auth login`, enterprise)
+- **Node.js** 18+ (e.g. `brew install node`) and `sqlite3` (preinstalled on
+  macOS; install via your package manager on Linux)
 - agentmemory already running (`npx @agentmemory/agentmemory`)
 - Optional: **Docker Model Runner** on :12434 — used as the automatic fallback
   when a Devin call fails, and as the embedding endpoint
 
 ## Install
+
+The scripts below are **macOS/launchd-specific**. `shim.mjs` itself is plain
+portable Node — on Linux or elsewhere, run `node shim.mjs` with the env vars
+from the tuning table under your own supervisor (systemd, pm2, etc.).
 
 ```bash
 cd devin-shim          # this folder, copied anywhere
