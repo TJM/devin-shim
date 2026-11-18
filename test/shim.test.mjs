@@ -4,7 +4,7 @@
 import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -50,6 +50,10 @@ function startShim(dir, env) {
       SESSIONS_DIR: join(dir, "sessions"),
       DEVIN_SESSIONS_DB: join(dir, "no-such-dir", "sessions.db"),
       DEVIN_TIMEOUT_MS: "10000",
+      // Gating is tested explicitly in its own suite — keep it off elsewhere
+      // so these tests never touch pmset or the real network.
+      SHIM_REQUIRE_FULL_WAKE: "0",
+      SHIM_REQUIRE_NET: "0",
       ...env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -207,5 +211,104 @@ describe("shim without fallback", () => {
     const { status, body } = await completion(BASE, "DIE please");
     assert.equal(status, 502);
     assert.match(body.error.message, /devin backend failed/);
+  });
+});
+
+// ---------- suite 3: gating ----------
+
+function writePmsetStub(dir, caps) {
+  const p = join(dir, "fake-pmset.sh");
+  writeFileSync(
+    p,
+    `#!/bin/sh\necho "Current System Capabilities are: ${caps}"\necho "Current Power State: 4"\n`,
+    { mode: 0o755 },
+  );
+  return p;
+}
+
+describe("gating", () => {
+  const P_DARK = 12494, P_OFFNET = 12495, P_OPEN = 12496, FB_PORT = 12497;
+  const B_DARK = `http://127.0.0.1:${P_DARK}`;
+  const B_OFFNET = `http://127.0.0.1:${P_OFFNET}`;
+  const B_OPEN = `http://127.0.0.1:${P_OPEN}`;
+  let darkShim, offnetShim, openShim, fallback, fallbackHits;
+
+  before(async () => {
+    fallbackHits = [];
+    fallback = http.createServer((req, res) => {
+      let b = "";
+      req.on("data", (c) => (b += c));
+      req.on("end", () => {
+        fallbackHits.push(JSON.parse(b || "{}"));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          id: "fb-1", object: "chat.completion", model: FALLBACK_MODEL,
+          choices: [{ index: 0, message: { role: "assistant", content: "FALLBACK-REPLY" }, finish_reason: "stop" }],
+        }));
+      });
+    });
+    await new Promise((r) => fallback.listen(FB_PORT, "127.0.0.1", r));
+
+    const dDark = makeTmpShim();
+    const dOffnet = makeTmpShim();
+    const dOpen = makeTmpShim();
+    const fbUrl = `http://127.0.0.1:${FB_PORT}`;
+    darkShim = startShim(dDark, {
+      SHIM_PORT: String(P_DARK),
+      FALLBACK_URL: fbUrl,
+      SHIM_REQUIRE_FULL_WAKE: "1",
+      SHIM_PMSET_BIN: writePmsetStub(dDark, "CPU Network"), // dark wake: no Graphics
+    });
+    offnetShim = startShim(dOffnet, {
+      SHIM_PORT: String(P_OFFNET),
+      FALLBACK_URL: fbUrl,
+      SHIM_REQUIRE_FULL_WAKE: "1",
+      SHIM_PMSET_BIN: writePmsetStub(dOffnet, "CPU Graphics Audio Network"),
+      SHIM_REQUIRE_NET: "1",
+      SHIM_NET_CHECK_URL: "http://127.0.0.1:1/", // always refused
+    });
+    openShim = startShim(dOpen, {
+      SHIM_PORT: String(P_OPEN),
+      FALLBACK_URL: fbUrl,
+      SHIM_REQUIRE_FULL_WAKE: "1",
+      SHIM_PMSET_BIN: writePmsetStub(dOpen, "CPU Graphics Audio Network"),
+      SHIM_REQUIRE_NET: "1",
+      SHIM_NET_CHECK_URL: fbUrl, // reachable stub stands in for the internet
+    });
+    await Promise.all([waitHealthy(B_DARK), waitHealthy(B_OFFNET), waitHealthy(B_OPEN)]);
+  });
+
+  after(() => {
+    darkShim?.kill("SIGKILL");
+    offnetShim?.kill("SIGKILL");
+    openShim?.kill("SIGKILL");
+    fallback?.close();
+    for (const d of tmpDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  test("dark wake -> 503 and fallback NOT used", async () => {
+    const { status, body } = await completion(B_DARK, "hello");
+    assert.equal(status, 503);
+    assert.match(body.error.message, /gated.*dark wake/);
+    assert.equal(fallbackHits.length, 0);
+  });
+
+  test("gated calls are counted in /v1/usage", async () => {
+    const j = await (await fetch(`${B_DARK}/v1/usage`)).json();
+    assert.ok(j.totals.gated >= 1);
+    assert.equal(j.totals.devin_calls, 0);
+  });
+
+  test("awake + unreachable net-check -> 503, fallback NOT used", async () => {
+    const { status, body } = await completion(B_OFFNET, "hello");
+    assert.equal(status, 503);
+    assert.match(body.error.message, /gated.*no internet/);
+    assert.equal(fallbackHits.length, 0);
+  });
+
+  test("full wake + reachable check -> normal completion", async () => {
+    const { status, body } = await completion(B_OPEN, "hello");
+    assert.equal(status, 200);
+    assert.equal(body.choices[0].message.content, "FAKE-REPLY");
   });
 });

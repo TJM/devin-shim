@@ -26,6 +26,12 @@
 //   SESSIONS_DIR           cwd for the devin process (default <shim>/sessions)
 //   DEVIN_BIN              devin binary path      (default "devin" via PATH;
 //                          launchd installs pin the resolved path)
+//   SHIM_REQUIRE_FULL_WAKE "0" disables the dark-wake gate (default on where
+//                          pmset exists — see gating section below)
+//   SHIM_REQUIRE_NET       "0" disables the connectivity check (default on)
+//   SHIM_NET_CHECK_URL     HEAD endpoint for connectivity (default api.devin.ai)
+//   SHIM_PMSET_BIN         pmset binary override   (default "pmset")
+//   SHIM_GATE_CACHE_MS     how long to reuse a gate verdict (default 15000)
 //
 // AGENTMEMORY_SDK_CHILD=1 and an empty XDG_CONFIG_HOME are set for the devin
 // subprocess so agentmemory hooks ignore it and ~/.config/devin rules/skills
@@ -62,6 +68,11 @@ const SESSIONS_DB =
   join(os.homedir(), ".local/share/devin/cli/sessions.db");
 const CHILD_XDG = join(HERE, "empty-config");
 const DEVIN_BIN = process.env.DEVIN_BIN || "devin";
+const REQUIRE_FULL_WAKE = (process.env.SHIM_REQUIRE_FULL_WAKE ?? "1") !== "0";
+const REQUIRE_NET = (process.env.SHIM_REQUIRE_NET ?? "1") !== "0";
+const NET_CHECK_URL = process.env.SHIM_NET_CHECK_URL || "https://api.devin.ai";
+const PMSET_BIN = process.env.SHIM_PMSET_BIN || "pmset";
+const GATE_CACHE_MS = parseInt(process.env.SHIM_GATE_CACHE_MS || "15000", 10);
 
 const WRAPPER =
   "You are being called as a raw text-completion API by an automated memory service. " +
@@ -129,6 +140,57 @@ async function recordUsage(entry) {
   const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
   appendFile(USAGE_LOG, line + "\n").catch(() => {});
   process.stdout.write(`[devin-shim] ${line}\n`);
+}
+
+// ---------- pre-call gate: full wake + connectivity ----------
+//
+// macOS "DarkWake" (Power Nap / rtc Maintenance wakes) runs launchd services
+// with display and audio off — the machine looks asleep, and agentmemory's
+// daemon happily burns ACU through us. pmset reports reduced capabilities in
+// that state ("CPU Network", no Graphics/Audio), so require Graphics as the
+// full-wake signal. Non-macOS hosts have no pmset: the check is skipped.
+//
+// Two signals, one outcome — refuse with 503 (never the fallback):
+//   dark/maintenance wake -> nobody is using the machine; a local model
+//     trades ACU for battery drain to serve a daemon that can simply retry
+//     on its next cycle.
+//   fully awake but offline -> Devin can't answer anyway; agentmemory's
+//     work is not latency-critical, so a clean refusal beats spinning up
+//     the fallback model. The DMR fallback remains solely for Devin turn
+//     failures while awake and online.
+
+function checkFullWake() {
+  if (!REQUIRE_FULL_WAKE) return null;
+  let out;
+  try {
+    out = execFileSync(PMSET_BIN, ["-g", "systemstate"], {
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).toString();
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    return "wake state unknown (pmset failed)";
+  }
+  const caps = out.match(/Capabilities are:\s*(.+)/i);
+  if (caps) return caps[1].includes("Graphics") ? null : "system in maintenance/dark wake";
+  const state = out.match(/Current Power State:\s*(\d+)/);
+  if (state) return parseInt(state[1], 10) >= 4 ? null : "system in low-power wake";
+  return "wake state unknown (unparseable pmset output)";
+}
+
+// Cached: the HEAD request is the only remote probe per GATE_CACHE_MS window.
+let netCheck = { at: 0, reason: null };
+async function checkOnline() {
+  if (!REQUIRE_NET) return null;
+  if (Date.now() - netCheck.at < GATE_CACHE_MS) return netCheck.reason;
+  let reason = null;
+  try {
+    await fetch(NET_CHECK_URL, { method: "HEAD", signal: AbortSignal.timeout(4000) });
+  } catch {
+    reason = `no internet (${NET_CHECK_URL} unreachable)`;
+  }
+  netCheck = { at: Date.now(), reason };
+  return reason;
 }
 
 // ---------- persistent ACP session ----------
@@ -426,7 +488,7 @@ async function proxyFallback(reqBody) {
 
 async function usageSummary() {
   const totals = {
-    calls: 0, devin_calls: 0, fallback_calls: 0, resumed_calls: 0, rotated: 0,
+    calls: 0, devin_calls: 0, fallback_calls: 0, gated: 0, resumed_calls: 0, rotated: 0,
     acu: 0, input_tokens: 0, output_tokens: 0,
     cache_creation_tokens: 0, cache_read_tokens: 0,
   };
@@ -437,7 +499,8 @@ async function usageSummary() {
       let e;
       try { e = JSON.parse(line); } catch { continue; }
       totals.calls++;
-      if (e.backend?.startsWith("devin")) {
+      if (e.backend === "gated") totals.gated++;
+      else if (e.backend?.startsWith("devin")) {
         totals.devin_calls++;
         if (e.resumed) totals.resumed_calls++;
         if (e.rotated) totals.rotated++;
@@ -468,6 +531,7 @@ const server = http.createServer(async (req, res) => {
       backend: `devin acp --model ${DEVIN_MODEL}`,
       session: acp.sessionId || null,
       session_reuse: `rotate >${MAX_CONTEXT_TOKENS} ctx tokens or ${MAX_CALLS_PER_SESSION} calls`,
+      gate: `full-wake:${REQUIRE_FULL_WAKE} net:${REQUIRE_NET ? NET_CHECK_URL : "off"}`,
       fallback: FALLBACK_URL || null,
       usage_log: USAGE_LOG,
     });
@@ -500,6 +564,11 @@ const server = http.createServer(async (req, res) => {
       .join("\n\n");
 
     const started = Date.now();
+    const reason = checkFullWake() ?? (await checkOnline());
+    if (reason) {
+      recordUsage({ backend: "gated", reason, latency_ms: Date.now() - started });
+      return send(503, { error: { message: `devin-shim gated: ${reason}` } });
+    }
     try {
       const content = await callDevin(systemPrompt, userPrompt);
       return send(200, openaiResponse(content, DEVIN_MODEL));

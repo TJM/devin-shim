@@ -30,6 +30,10 @@ agentmemory ──OPENAI_BASE_URL──> devin-shim (:12440) ──ACP──> de
   hooks ignore shim sessions (no compress→observe→compress recursion), and an
   empty `XDG_CONFIG_HOME` keeps your personal `~/.config/devin` rules, skills,
   and hooks out of the shim session's context.
+- **Wake/network gate**: before any Devin call, the shim verifies the machine
+  is in a real (full) wake — not a macOS DarkWake/Power Nap maintenance wake —
+  and that the Devin API is reachable. Gated calls get an immediate `503`
+  (no ACU, no fallback spin-up). See "Sleep gating" below.
 
 ## Prerequisites
 
@@ -104,6 +108,11 @@ tail -f ~/.agentmemory/devin-shim/shim.log      # service log
 | `SHIM_SESSION_MAX_CALLS` | `150` | hard cap on turns per session |
 | `FALLBACK_URL` | `http://localhost:12434` | OpenAI-compatible fallback (empty = disable) |
 | `FALLBACK_MODEL` | `ai/qwen2.5:7B-Q4_0` | model substituted on fallback requests |
+| `SHIM_REQUIRE_FULL_WAKE` | `1` | refuse calls during DarkWake/maintenance wakes (`0` disables) |
+| `SHIM_REQUIRE_NET` | `1` | refuse calls when the net-check endpoint is unreachable (`0` disables) |
+| `SHIM_NET_CHECK_URL` | `https://api.devin.ai` | HEAD endpoint used for the connectivity check |
+| `SHIM_PMSET_BIN` | `pmset` | pmset override (testing) |
+| `SHIM_GATE_CACHE_MS` | `15000` | cache the gate verdict this long |
 
 ## Tests
 
@@ -116,6 +125,38 @@ End-to-end, fully offline: `test/fake-devin.mjs` stubs `devin acp` over stdio
 server stands in for the fallback. Covers happy path, session reuse, context
 rotation, fallback, 400/404/502s. `test-acp.mjs` is the live smoke test against
 a real Devin session — it costs a little ACU.
+
+## Sleep gating
+
+macOS keeps waking the machine while it looks asleep — `rtc/Maintenance`
+DarkWakes (Power Nap), `TCPKATurnOff`, calendar timers. Launchd doesn't
+distinguish those from a real wake, so agentmemory's daemon used to fire LLM
+calls (and burn ACU) at 3am on battery. The shim now refuses those calls:
+
+- **Full-wake check** (`pmset -g systemstate`): a full wake lists `Graphics`
+  in the system capabilities; a DarkWake reports only `CPU Network`. Missing
+  `pmset` (Linux/other) → check is skipped, so the shim stays portable.
+- **Connectivity check**: a `HEAD` to `SHIM_NET_CHECK_URL` (any HTTP response
+  = online). This also prevents the ~110s stalled-turn churn when the machine
+  wakes somewhere with no internet.
+- **Gated calls** return `503` immediately and **skip the DMR fallback on
+  purpose** — running a local model during a battery-powered maintenance wake
+  trades ACU for battery drain, and offline refusals are equally cheap:
+  agentmemory's work is not latency-critical, so it sees a provider error
+  and retries on its next cycle. The fallback remains solely for Devin turn
+  failures while awake and online.
+- Gated calls are logged as `backend: "gated"` in `usage.jsonl` and counted
+  under `totals.gated` in `GET /v1/usage`, so you can watch what was refused:
+
+  ```bash
+  curl -s localhost:12440/v1/usage | jq .totals.gated
+  jq -r 'select(.backend=="gated") | [.ts, .reason] | @tsv' usage.jsonl | tail
+  ```
+
+Complement (optional, needs sudo): reduce the dark wakes themselves with
+`sudo pmset -a powernap 0` or disable "Wake for network access" in System
+Settings → Battery. The gate works either way; this just shrinks how often
+the daemon runs at all.
 
 ## Uninstall
 
